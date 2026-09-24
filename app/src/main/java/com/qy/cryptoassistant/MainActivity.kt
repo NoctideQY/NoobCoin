@@ -47,6 +47,8 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONArray
+import org.json.JSONObject
 
 private val Purple = Color(0xFF7132F5)
 private val Ink = Color(0xFF17151D)
@@ -93,6 +95,32 @@ private fun compactNumber(value: Double): String = when {
     else -> String.format(Locale.US, "%.2f", value)
 }
 
+private data class AssetSnapshot(val timestamp: Long, val totalUsdt: Double)
+
+private const val CURRENT_VERSION = "0.2.0"
+private const val DEFAULT_ANALYSIS_PROMPT = "保持清晰、谨慎、适合新手的语气，先讲事实，再讲风险。"
+private const val DEFAULT_ADVICE_PROMPT = "保持克制，不煽动交易；把建议写成风险提示，说明不确定性。"
+private const val CATGIRL_TONE = "请用轻松可爱的猫娘语气表达，但仍然准确、克制、尊重用户；不要卖萌掩盖风险。"
+private const val BRATTY_TONE = "请用俏皮、略带挑衅但不侮辱人的语气表达；仍然必须基于事实、明确风险，不得诱导冲动交易。"
+
+private fun readAssetSnapshots(prefs: android.content.SharedPreferences): List<AssetSnapshot> = runCatching {
+    val array = JSONArray(prefs.getString("asset_history", "[]"))
+    (0 until array.length()).mapNotNull { index ->
+        array.optJSONObject(index)?.let { AssetSnapshot(it.optLong("time"), it.optDouble("total")) }
+    }.filter { it.timestamp > 0 && it.totalUsdt >= 0 }.sortedBy { it.timestamp }
+}.getOrDefault(emptyList())
+
+private fun writeAssetSnapshot(prefs: android.content.SharedPreferences, total: Double, now: Long = System.currentTimeMillis()): List<AssetSnapshot> {
+    val current = readAssetSnapshots(prefs).toMutableList()
+    if (current.lastOrNull()?.let { now - it.timestamp < 30 * 60 * 1000 } == true) return current
+    current += AssetSnapshot(now, total)
+    val kept = current.takeLast(31)
+    prefs.edit().putString("asset_history", JSONArray().apply {
+        kept.forEach { put(JSONObject().put("time", it.timestamp).put("total", it.totalUsdt)) }
+    }.toString()).apply()
+    return kept
+}
+
 @Composable
 private fun CryptoAssetApp() {
     val context = LocalContext.current.applicationContext
@@ -117,6 +145,15 @@ private fun CryptoAssetApp() {
     var aiError by remember { mutableStateOf<String?>(null) }
     var aiBusy by remember { mutableStateOf(false) }
     var confirmAi by remember { mutableStateOf(false) }
+    var aiSection by rememberSaveable { mutableIntStateOf(0) }
+    var adviceResult by remember { mutableStateOf<String?>(null) }
+    var adviceError by remember { mutableStateOf<String?>(null) }
+    var adviceBusy by remember { mutableStateOf(false) }
+    var confirmAdvice by remember { mutableStateOf(false) }
+    var adviceNews by remember { mutableStateOf<List<NewsItem>>(emptyList()) }
+    var update by remember { mutableStateOf<GithubRelease?>(null) }
+    var updateBusy by remember { mutableStateOf(false) }
+    var updateError by remember { mutableStateOf<String?>(null) }
     var selectedSymbol by remember { mutableStateOf<String?>(null) }
     var selectedTicker by remember { mutableStateOf<MarketTicker?>(null) }
     var favorites by remember { mutableStateOf(prefs.getStringSet("favorites", emptySet())?.toSet() ?: emptySet()) }
@@ -151,6 +188,8 @@ private fun CryptoAssetApp() {
                     configured = true
                     holdings = data
                     accountTime = System.currentTimeMillis()
+                    val total = data.mapNotNull { it.valueUsdt }.sum()
+                    if (total > 0) writeAssetSnapshot(prefs, total)
                     dialog = null
                 }
             } catch (e: Exception) {
@@ -188,10 +227,39 @@ private fun CryptoAssetApp() {
         aiResult = null
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { AiApi.analyze(provider, key, model, snapshot) }
+                val prompt = prefs.getString("ai_analysis_prompt", DEFAULT_ANALYSIS_PROMPT).orEmpty()
+                val result = withContext(Dispatchers.IO) { AiApi.analyze(provider, key, model, snapshot, prompt) }
                 if (generation == accountGeneration) { aiResult = result; aiTime = accountTime }
             } catch (e: Exception) { aiError = message(e) }
             finally { aiBusy = false }
+        }
+    }
+
+    fun advise() {
+        val snapshot = holdings ?: return
+        val generation = accountGeneration
+        val key = SecretStore.read(context, "ai_key") ?: return
+        val model = SecretStore.read(context, "ai_model") ?: return
+        val provider = aiProvider
+        adviceBusy = true; adviceError = null; adviceResult = null
+        scope.launch {
+            try {
+                val news = withContext(Dispatchers.IO) { runCatching { NewsApi.fetchLatest() }.getOrDefault(emptyList()) }
+                val prompt = prefs.getString("ai_advice_prompt", DEFAULT_ADVICE_PROMPT).orEmpty()
+                val result = withContext(Dispatchers.IO) { AiApi.advice(provider, key, model, snapshot, market?.tickers.orEmpty(), news, prompt) }
+                if (generation == accountGeneration) { adviceNews = news; adviceResult = result }
+            } catch (e: Exception) { adviceError = message(e) }
+            finally { adviceBusy = false }
+        }
+    }
+
+    fun checkUpdate() {
+        if (updateBusy) return
+        updateBusy = true; updateError = null
+        scope.launch {
+            try { update = withContext(Dispatchers.IO) { GithubApi.latestRelease() } }
+            catch (e: Exception) { updateError = message(e) }
+            finally { updateBusy = false }
         }
     }
 
@@ -234,7 +302,7 @@ private fun CryptoAssetApp() {
                 )
             } else when (tab) {
                 0 -> PortfolioScreen(modifier, holdings, accountTime, accountBusy, accountError,
-                    configured, currency, market?.usdtToCny, ::refreshAccount, { dialog = "binance" })
+                    configured, currency, market?.usdtToCny, prefs, ::refreshAccount, { dialog = "binance" })
                 1 -> MarketScreen(
                     modifier = modifier,
                     snapshot = market,
@@ -266,13 +334,17 @@ private fun CryptoAssetApp() {
                     Heading("AI 组合分析")
                     SettingRow("AI Provider", if (aiConfigured) "$aiProvider · 已配置" else "未配置",
                         { dialog = "ai" })
+                    TabRow(selectedTabIndex = aiSection, containerColor = Color.Transparent) {
+                        Tab(aiSection == 0, { aiSection = 0 }, text = { Text("分析持仓") })
+                        Tab(aiSection == 1, { aiSection = 1 }, text = { Text("持仓建议") })
+                    }
                     when {
                         holdings == null -> EmptyContent("尚无真实持仓", "请先连接 Binance 只读账户。",
                             "连接 Binance", { dialog = "binance" })
                         !aiConfigured -> EmptyContent("尚未配置 AI", "DeepSeek / Kimi", "配置 API", { dialog = "ai" })
                         holdings!!.isEmpty() -> Text("现货账户暂无非零余额。", color = Muted)
                         holdings!!.any { it.valueUsdt == null } -> Text("部分持仓尚未取得价格，请刷新账户后再分析。", color = Muted)
-                        else -> {
+                        else -> if (aiSection == 0) {
                             Text("账户快照：${timeLabel(accountTime)}", color = Muted)
                             Button(onClick = { confirmAi = true }, enabled = !aiBusy && !accountBusy,
                                 shape = RoundedCornerShape(12.dp)) {
@@ -280,6 +352,15 @@ private fun CryptoAssetApp() {
                                 Spacer(Modifier.width(8.dp))
                                 Text(if (aiBusy) "正在分析…" else "分析持仓")
                             }
+                        } else {
+                            Text("建议周期：未来 7 天 · 将读取实时行情和公开新闻", color = Muted)
+                            Button(onClick = { confirmAdvice = true }, enabled = !adviceBusy && !accountBusy && market != null,
+                                shape = RoundedCornerShape(12.dp)) {
+                                Icon(Icons.Outlined.TrendingUp, null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(if (adviceBusy) "正在获取行情与新闻…" else "生成持仓建议")
+                            }
+                            Text("建议只用于研究，不会执行交易；新闻不足时会明确提示。", color = Muted, fontSize = 12.sp)
                         }
                     }
                     aiError?.let { ErrorState(it) }
@@ -287,6 +368,13 @@ private fun CryptoAssetApp() {
                         Text("持仓快照：${timeLabel(aiTime)} · $aiProvider", color = Muted, fontSize = 12.sp)
                         Text(it, lineHeight = 24.sp)
                         Text("AI 可能出错；以上不是交易指令。", color = Muted, fontSize = 12.sp)
+                    }
+                    adviceError?.let { ErrorState(it) }
+                    adviceResult?.let {
+                        Text("建议生成时间：${timeLabel(System.currentTimeMillis())} · $aiProvider", color = Muted, fontSize = 12.sp)
+                        Text(it, lineHeight = 24.sp)
+                        if (adviceNews.isNotEmpty()) Text("已参考 ${adviceNews.size} 条公开新闻；新闻链接已作为上下文提供给模型。", color = Muted, fontSize = 12.sp)
+                        Text("以上是风险提示，不构成投资建议，也不会自动买卖。", color = Muted, fontSize = 12.sp)
                     }
                 }
                 else -> Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
@@ -300,6 +388,16 @@ private fun CryptoAssetApp() {
                     }, { dialog = "binance" })
                     SettingRow("AI Provider", if (aiConfigured) "$aiProvider · 已配置" else "DeepSeek / Kimi · 未配置",
                         { dialog = "ai" })
+                    SettingRow("AI 提示词", "分别编辑持仓分析与持仓建议语气", { dialog = "prompts" })
+                    SettingRow("检查 NoobCoin 更新", if (updateBusy) "正在检查…" else "GitHub 公开仓库 · v$CURRENT_VERSION", ::checkUpdate)
+                    updateError?.let { ErrorState(it) }
+                    update?.let { release ->
+                        val newer = release.tagName.trimStart('v') != CURRENT_VERSION
+                        Text(if (newer) "发现新版本：${release.tagName}" else "当前已是最新版本（${release.tagName}）", color = if (newer) Purple else Positive, fontWeight = FontWeight.SemiBold)
+                        if (release.body.isNotBlank()) Text(release.body.take(1200), color = Muted, lineHeight = 20.sp)
+                        val uriHandler = LocalUriHandler.current
+                        if (release.htmlUrl.isNotBlank()) TextButton({ uriHandler.openUri(release.htmlUrl) }) { Text("打开 GitHub Release") }
+                    }
                     Text("计价货币", fontWeight = FontWeight.SemiBold)
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf("CNY", "USD", "USDT").forEach { value ->
@@ -324,11 +422,17 @@ private fun CryptoAssetApp() {
             aiResult = null
             dialog = null
         }, { dialog = null })
+        if (dialog == "prompts" && selectedSymbol == null) PromptDialog({ dialog = null })
         if (confirmAi) AlertDialog(onDismissRequest = { confirmAi = false },
             title = { Text("发送持仓摘要给 $aiProvider？") },
             text = { Text("仅发送币种和持仓占比，不发送余额数量、账户总额或 Binance 密钥。请求可能产生服务商 API 费用。") },
             confirmButton = { TextButton(onClick = { confirmAi = false; analyze() }) { Text("确认并分析") } },
             dismissButton = { TextButton(onClick = { confirmAi = false }) { Text("取消") } })
+        if (confirmAdvice) AlertDialog(onDismissRequest = { confirmAdvice = false },
+            title = { Text("获取行情和新闻后生成建议？") },
+            text = { Text("会发送币种、持仓占比、实时行情以及公开新闻标题和链接给 $aiProvider。不会发送 Binance 密钥或具体余额。") },
+            confirmButton = { TextButton(onClick = { confirmAdvice = false; advise() }) { Text("确认并生成") } },
+            dismissButton = { TextButton(onClick = { confirmAdvice = false }) { Text("取消") } })
     }
 }
 
@@ -424,7 +528,7 @@ private fun WatchlistScreen(
 }
 
 @Composable private fun PortfolioScreen(modifier: Modifier, holdings: List<BinanceHolding>?, time: Long,
-    busy: Boolean, error: String?, configured: Boolean, currency: String, fx: Double?,
+    busy: Boolean, error: String?, configured: Boolean, currency: String, fx: Double?, prefs: android.content.SharedPreferences,
     refresh: () -> Unit, settings: () -> Unit) {
     LazyColumn(modifier.fillMaxSize().padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp), contentPadding = PaddingValues(vertical = 20.dp)) {
@@ -473,8 +577,42 @@ private fun WatchlistScreen(
                 }
                 HorizontalDivider(Modifier.padding(top = 12.dp), color = Color(0xFFE8E6ED))
             }
-            item { Text("暂无历史快照。", color = Muted, fontSize = 12.sp) }
+            item { AssetHistorySection(prefs, currency, fx) }
         }
+    }
+}
+
+@Composable private fun AssetHistorySection(prefs: android.content.SharedPreferences, currency: String, fx: Double?) {
+    var range by rememberSaveable { mutableIntStateOf(3) }
+    val snapshots = readAssetSnapshots(prefs).filter { System.currentTimeMillis() - it.timestamp <= range * 24L * 60 * 60 * 1000 }
+    Text("资产估值变化", fontWeight = FontWeight.SemiBold)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(3, 7, 10).forEach { days -> FilterChip(range == days, { range = days }, label = { Text("近${days}天") }) }
+    }
+    Text("仅统计成功同步后的本地估值快照；充值和提现也会影响曲线。", color = Muted, fontSize = 11.sp)
+    if (snapshots.size < 2) {
+        Text("数据积累中，至少需要两次成功同步后显示曲线。", color = Muted)
+    } else {
+        val values = snapshots.map { it.totalUsdt }
+        Text("起点 ${amount(values.first(), currency, fx)} · 当前 ${amount(values.last(), currency, fx)}", color = Muted, fontSize = 12.sp)
+        LineChart(values, Modifier.fillMaxWidth().height(150.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(timeLabel(snapshots.first().timestamp), color = Muted, fontSize = 10.sp)
+            Text(timeLabel(snapshots.last().timestamp), color = Muted, fontSize = 10.sp)
+        }
+    }
+}
+
+@Composable private fun LineChart(values: List<Double>, modifier: Modifier) {
+    Canvas(modifier) {
+        val min = values.minOrNull() ?: 0.0
+        val max = values.maxOrNull() ?: 1.0
+        val span = (max - min).takeIf { it > 0 } ?: 1.0
+        val step = size.width / values.lastIndex.coerceAtLeast(1)
+        val points = values.mapIndexed { index, value -> Offset(step * index, size.height * (1f - ((value - min) / span).toFloat())) }
+        val path = Path().apply { points.forEachIndexed { i, point -> if (i == 0) moveTo(point.x, point.y) else lineTo(point.x, point.y) } }
+        drawPath(path, Purple, style = Stroke(width = 4f, cap = StrokeCap.Round))
+        points.forEach { drawCircle(Purple, 5f, it) }
     }
 }
 
@@ -866,6 +1004,32 @@ private fun CandlestickChart(points: List<KlinePoint>, modifier: Modifier) {
             } catch (e: Exception) { error = message(e) }
         }, enabled = !busy && verifiedKey != null && model.isNotBlank()) { Text("保存") }
     }, dismissButton = { TextButton(close) { Text("关闭") } })
+}
+
+@Composable private fun PromptDialog(close: () -> Unit) {
+    val context = LocalContext.current.applicationContext
+    val prefs = remember { context.getSharedPreferences("preferences", Context.MODE_PRIVATE) }
+    var preset by remember { mutableStateOf(prefs.getString("ai_tone_preset", "默认") ?: "默认") }
+    var analysis by remember { mutableStateOf(prefs.getString("ai_analysis_prompt", DEFAULT_ANALYSIS_PROMPT) ?: DEFAULT_ANALYSIS_PROMPT) }
+    var advice by remember { mutableStateOf(prefs.getString("ai_advice_prompt", DEFAULT_ADVICE_PROMPT) ?: DEFAULT_ADVICE_PROMPT) }
+    fun applyPreset(name: String) {
+        preset = name
+        val tone = when (name) { "猫娘" -> CATGIRL_TONE; "雌小鬼" -> BRATTY_TONE; else -> "" }
+        analysis = if (tone.isBlank()) DEFAULT_ANALYSIS_PROMPT else tone
+        advice = if (tone.isBlank()) DEFAULT_ADVICE_PROMPT else tone
+    }
+    AlertDialog(onDismissRequest = close, title = { Text("AI 提示词") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("预设只改变表达语气，事实约束和风险提示仍然保留。你也可以直接编辑。", color = Muted, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                listOf("默认", "猫娘", "雌小鬼").forEach { name -> FilterChip(preset == name, { applyPreset(name) }, label = { Text(name) }) }
+            }
+            OutlinedTextField(analysis, { analysis = it.take(8000); preset = "自定义" }, Modifier.fillMaxWidth(), minLines = 4, label = { Text("分析持仓提示词") })
+            OutlinedTextField(advice, { advice = it.take(8000); preset = "自定义" }, Modifier.fillMaxWidth(), minLines = 4, label = { Text("持仓建议提示词") })
+        }
+    }, confirmButton = {
+        TextButton({ prefs.edit().putString("ai_tone_preset", preset).putString("ai_analysis_prompt", analysis).putString("ai_advice_prompt", advice).apply(); close() }) { Text("保存") }
+    }, dismissButton = { TextButton(close) { Text("取消") } })
 }
 
 @Composable private fun SecretField(label: String, value: String, change: (String) -> Unit, enabled: Boolean) {

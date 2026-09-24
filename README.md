@@ -2,6 +2,8 @@
 
 NoobCoin 是一个面向加密货币新手的本地 Android 资产助手。应用中文名为“菜币”，英文产品名和 GitHub 仓库名为 `NoobCoin`。
 
+当前版本：`0.2.0`
+
 ## 当前能力
 
 - Binance 公共行情与真实 K 线
