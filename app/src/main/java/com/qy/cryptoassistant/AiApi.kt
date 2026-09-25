@@ -6,6 +6,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 object AiApi {
+    data class Message(val role: String, val content: String)
     private fun base(provider: String): String = when (provider) {
         "Kimi" -> "https://api.moonshot.cn/v1"
         "DeepSeek" -> "https://api.deepseek.com"
@@ -59,6 +60,33 @@ object AiApi {
         return content(body, "建议")
     }
 
+    fun streamChat(provider: String, apiKey: String, model: String, messages: List<Message>, onDelta: (String) -> Unit): String {
+        require(messages.isNotEmpty()) { "会话内容不能为空。" }
+        val payload = JSONObject().apply {
+            put("model", model); put("stream", true); put("max_tokens", 2400)
+            if (provider == "DeepSeek") put("thinking", JSONObject().put("type", "disabled"))
+            put("messages", JSONArray().apply { messages.forEach { put(JSONObject().put("role", it.role).put("content", it.content)) } })
+        }
+        val connection = open(base(provider) + "/chat/completions", apiKey, payload)
+        val output = StringBuilder()
+        try {
+            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            if (connection.responseCode !in 200..299) error("AI 请求失败（HTTP ${connection.responseCode}），请稍后重试。")
+            val reader = connection.inputStream.bufferedReader()
+            reader.forEachLine { line ->
+                val data = line.removePrefix("data:").trim()
+                if (data.isBlank() || data == "[DONE]") return@forEachLine
+                runCatching {
+                    val root = JSONObject(data)
+                    val delta = root.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta")?.optString("content").orEmpty()
+                    if (delta.isNotEmpty()) { output.append(delta); onDelta(delta) }
+                }
+            }
+            if (output.isEmpty()) error("模型未返回聊天正文，请重试或更换可对话模型。")
+            return output.toString()
+        } finally { connection.disconnect() }
+    }
+
     private fun content(body: String, purpose: String): String {
         val root = JSONObject(body)
         val choice = root.optJSONArray("choices")?.optJSONObject(0)
@@ -73,17 +101,9 @@ object AiApi {
     }
 
     private fun request(endpoint: String, apiKey: String, payload: JSONObject? = null): String {
-        val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-            requestMethod = if (payload == null) "GET" else "POST"
-            connectTimeout = 15_000
-            readTimeout = 60_000
-            instanceFollowRedirects = false
-            setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
-            setRequestProperty("Content-Type", "application/json")
-        }
+        val connection = open(endpoint, apiKey, payload)
         try {
             if (payload != null) {
-                connection.doOutput = true
                 connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
             }
             val code = connection.responseCode
@@ -99,4 +119,15 @@ object AiApi {
             connection.disconnect()
         }
     }
+
+    private fun open(endpoint: String, apiKey: String, payload: JSONObject?): HttpURLConnection =
+        (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = if (payload == null) "GET" else "POST"
+            connectTimeout = 15_000
+            readTimeout = if (payload == null) 60_000 else 120_000
+            instanceFollowRedirects = false
+            setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = payload != null
+        }
 }

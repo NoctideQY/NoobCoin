@@ -97,7 +97,7 @@ private fun compactNumber(value: Double): String = when {
 
 private data class AssetSnapshot(val timestamp: Long, val totalUsdt: Double)
 
-private const val CURRENT_VERSION = "0.2.1"
+private const val CURRENT_VERSION = "0.3.0"
 private const val DEFAULT_ANALYSIS_PROMPT = "保持清晰、谨慎、适合新手的语气，先讲事实，再讲风险。"
 private const val DEFAULT_ADVICE_PROMPT = "保持克制，不煽动交易；把建议写成风险提示，说明不确定性。"
 private const val CATGIRL_TONE = "请用轻松可爱的猫娘语气表达，但仍然准确、克制、尊重用户；不要卖萌掩盖风险。"
@@ -329,54 +329,17 @@ private fun CryptoAssetApp() {
                     error = marketError ?: accountError,
                     refresh = { scope.launch { refreshMarket() }; if (configured) refreshAccount() },
                 )
-                3 -> Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Heading("AI 组合分析")
-                    SettingRow("AI Provider", if (aiConfigured) "$aiProvider · 已配置" else "未配置",
-                        { dialog = "ai" })
-                    TabRow(selectedTabIndex = aiSection, containerColor = Color.Transparent) {
-                        Tab(aiSection == 0, { aiSection = 0 }, text = { Text("分析持仓") })
-                        Tab(aiSection == 1, { aiSection = 1 }, text = { Text("持仓建议") })
-                    }
-                    when {
-                        holdings == null -> EmptyContent("尚无真实持仓", "请先连接 Binance 只读账户。",
-                            "连接 Binance", { dialog = "binance" })
-                        !aiConfigured -> EmptyContent("尚未配置 AI", "DeepSeek / Kimi", "配置 API", { dialog = "ai" })
-                        holdings!!.isEmpty() -> Text("现货账户暂无非零余额。", color = Muted)
-                        holdings!!.any { it.valueUsdt == null } -> Text("部分持仓尚未取得价格，请刷新账户后再分析。", color = Muted)
-                        else -> if (aiSection == 0) {
-                            Text("账户快照：${timeLabel(accountTime)}", color = Muted)
-                            Button(onClick = { confirmAi = true }, enabled = !aiBusy && !accountBusy,
-                                shape = RoundedCornerShape(12.dp)) {
-                                Icon(Icons.Outlined.AutoAwesome, null)
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (aiBusy) "正在分析…" else "分析持仓")
-                            }
-                        } else {
-                            Text("建议周期：未来 7 天 · 将读取实时行情和公开新闻", color = Muted)
-                            Button(onClick = { confirmAdvice = true }, enabled = !adviceBusy && !accountBusy && market != null,
-                                shape = RoundedCornerShape(12.dp)) {
-                                Icon(Icons.Outlined.TrendingUp, null)
-                                Spacer(Modifier.width(8.dp))
-                                Text(if (adviceBusy) "正在获取行情与新闻…" else "生成持仓建议")
-                            }
-                            Text("建议只用于研究，不会执行交易；新闻不足时会明确提示。", color = Muted, fontSize = 12.sp)
-                        }
-                    }
-                    aiError?.let { ErrorState(it) }
-                    aiResult?.let {
-                        Text("持仓快照：${timeLabel(aiTime)} · $aiProvider", color = Muted, fontSize = 12.sp)
-                        Text(it, lineHeight = 24.sp)
-                        Text("AI 可能出错；以上不是交易指令。", color = Muted, fontSize = 12.sp)
-                    }
-                    adviceError?.let { ErrorState(it) }
-                    adviceResult?.let {
-                        Text("建议生成时间：${timeLabel(System.currentTimeMillis())} · $aiProvider", color = Muted, fontSize = 12.sp)
-                        Text(it, lineHeight = 24.sp)
-                        if (adviceNews.isNotEmpty()) Text("已参考 ${adviceNews.size} 条公开新闻；新闻链接已作为上下文提供给模型。", color = Muted, fontSize = 12.sp)
-                        Text("以上是风险提示，不构成投资建议，也不会自动买卖。", color = Muted, fontSize = 12.sp)
-                    }
-                }
+                3 -> AiWorkspaceScreen(
+                    modifier = modifier,
+                    appContext = context,
+                    provider = aiProvider,
+                    configured = aiConfigured,
+                    holdings = holdings,
+                    market = market,
+                    prefs = prefs,
+                    openAiSettings = { dialog = "ai" },
+                    openBinanceSettings = { dialog = "binance" },
+                )
                 else -> Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Heading("我的")
