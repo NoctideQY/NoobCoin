@@ -97,7 +97,7 @@ private fun compactNumber(value: Double): String = when {
 
 private data class AssetSnapshot(val timestamp: Long, val totalUsdt: Double)
 
-private const val CURRENT_VERSION = "0.3.0"
+private const val CURRENT_VERSION = "0.3.1"
 private const val DEFAULT_ANALYSIS_PROMPT = "保持清晰、谨慎、适合新手的语气，先讲事实，再讲风险。"
 private const val DEFAULT_ADVICE_PROMPT = "保持克制，不煽动交易；把建议写成风险提示，说明不确定性。"
 private const val CATGIRL_TONE = "请用轻松可爱的猫娘语气表达，但仍然准确、克制、尊重用户；不要卖萌掩盖风险。"
@@ -921,13 +921,7 @@ private fun CandlestickChart(points: List<KlinePoint>, modifier: Modifier) {
         scope.launch {
             try {
                 models = withContext(Dispatchers.IO) { AiApi.models(provider, candidate) }
-                model = when {
-                    provider == "DeepSeek" -> models.firstOrNull { it == "deepseek-chat" }
-                        ?: models.firstOrNull { it == "deepseek-v4-pro" }
-                        ?: models.firstOrNull { it == "deepseek-flash" }
-                        ?: models.first()
-                    else -> models.firstOrNull { it == "moonshot-v1-8k" } ?: models.first()
-                }
+                model = AiApi.preferredModel(provider, models)
                 verifiedKey = candidate
             } catch (e: Exception) { error = message(e); models = emptyList(); verifiedKey = null }
             finally { busy = false }

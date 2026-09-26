@@ -7,6 +7,19 @@ import java.net.URL
 
 object AiApi {
     data class Message(val role: String, val content: String)
+
+    const val DEEPSEEK_PRO = "deepseek-v4-pro"
+    const val DEEPSEEK_FLASH = "deepseek-flash"
+
+    fun preferredModel(provider: String, models: List<String>): String = when {
+        provider == "DeepSeek" && DEEPSEEK_PRO in models -> DEEPSEEK_PRO
+        provider == "DeepSeek" && DEEPSEEK_FLASH in models -> DEEPSEEK_FLASH
+        provider == "DeepSeek" && models.any { it.contains("pro", ignoreCase = true) } -> models.first { it.contains("pro", ignoreCase = true) }
+        provider == "DeepSeek" && models.any { it.contains("flash", ignoreCase = true) } -> models.first { it.contains("flash", ignoreCase = true) }
+        provider == "Kimi" && "moonshot-v1-8k" in models -> "moonshot-v1-8k"
+        else -> models.firstOrNull().orEmpty()
+    }
+
     private fun base(provider: String): String = when (provider) {
         "Kimi" -> "https://api.moonshot.cn/v1"
         "DeepSeek" -> "https://api.deepseek.com"
